@@ -1,376 +1,18 @@
 #!/usr/bin/env python3
 """Unofficial Faygo VPN for Linux (TUN by default; --proxy for local proxy only)."""
 import argparse
-import base64
-import fcntl
 import getpass
-import json
 import os
 from pathlib import Path
-import pwd
-import shutil
-import signal
-import socket
-import subprocess
 import sys
-import tempfile
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
 
-API = "https://faygoconnect.com/api/v1/"
-HOME = Path(pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir) if os.geteuid() == 0 and os.environ.get("SUDO_USER") else Path.home()
-CONFIG = HOME / ".config/faygo-cli"
-STATE_DIR = Path("/var/lib/faygo-cli")
-STATE_FILE = STATE_DIR / "state.json"
-TUN = "faygo0"
-TABLE = "20580"
-MARK = "0xf2080"
-PRIORITIES = range(20580, 20585)
+sys.dont_write_bytecode = True  # sudo must not leave root-owned caches in a user release.
 
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None  # Never forward the access key to another URL.
-
-
-def save_private(path, text):
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as stream:
-        os.fchmod(stream.fileno(), 0o600)
-        stream.write(text)
-
-
-def access_key():
-    try:
-        return str(uuid.UUID((CONFIG / "key").read_text().strip()))
-    except (OSError, ValueError):
-        raise RuntimeError("Нет UUID-ключа. Выполни: faygo login") from None
-
-
-def device_name():
-    path = CONFIG / "device-name"
-    name = path.read_text().strip() if path.exists() else "Faygo CLI Linux"
-    if not name or len(name) > 128 or any(not 32 <= ord(char) <= 126 for char in name):
-        raise RuntimeError("Имя устройства должно содержать 1–128 печатных ASCII-символов")
-    return name
-
-
-def api(endpoint, **params):
-    key = access_key()
-    device = CONFIG / "device-id"
-    if not device.exists():
-        save_private(device, str(uuid.uuid4()))
-    url = API + endpoint
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={
-        "X-Access-Key": key,
-        "X-HwID": device.read_text().strip(),
-        "X-Device-Name": device_name(),
-        "X-App-Version": "1.4.1",
-        "Accept": "application/json",
-    })
-    try:
-        with urllib.request.build_opener(NoRedirect).open(request, timeout=25) as response:
-            data = response.read(4 * 1024 * 1024 + 1)
-        if len(data) > 4 * 1024 * 1024:
-            raise RuntimeError("Слишком большой ответ API")
-        return json.loads(data)
-    except urllib.error.HTTPError as error:
-        raise RuntimeError(f"Faygo API: HTTP {error.code}. Проверь ключ, подписку и лимит устройств.") from None
-    except (urllib.error.URLError, TimeoutError, ValueError):
-        raise RuntimeError("Не удалось получить JSON от Faygo API (сеть или формат ответа).") from None
-
-
-def interrupted(*_):
-    raise KeyboardInterrupt
-
-
-def netcmd(*command, check=True, input=None):
-    result = subprocess.run(command, input=input, capture_output=True, text=True)
-    if check and result.returncode:
-        raise RuntimeError(f"Команда {' '.join(command)}: {result.stderr.strip()[:300]}")
-    return result
-
-
-def network_lock():
-    lock = open("/run/faygo-cli.lock", "a")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock.close()
-        raise RuntimeError("Faygo VPN уже работает; сначала останови его") from None
-    return lock
-
-
-def write_state(state):
-    temporary = STATE_DIR / "state.tmp"
-    save_private(temporary, json.dumps(state))
-    temporary.replace(STATE_FILE)
-
-
-def process_token(pid):
-    try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-    except FileNotFoundError:
-        return None
-
-
-def firewall_exists():
-    tables = json.loads(netcmd("nft", "-j", "list", "tables").stdout)["nftables"]
-    return any(x.get("table", {}).get("name") == "faygo_cli" and
-               x.get("table", {}).get("family") == "inet" for x in tables)
-
-
-def restore_network():
-    if not STATE_FILE.exists():
-        print("Сохранённого сеанса Faygo нет; сеть не изменяю.", flush=True)
-        return
-    state = json.loads(STATE_FILE.read_text())
-    pid = state.get("pid")
-    if pid and process_token(pid) == state.get("process_token"):
-        try:
-            os.kill(pid, signal.SIGTERM)
-            deadline = time.monotonic() + 5
-            while process_token(pid) == state["process_token"] and time.monotonic() < deadline:
-                time.sleep(0.1)
-            if process_token(pid) == state["process_token"]:
-                os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass  # The core can finish between the identity check and kill().
-    # Reserved priorities/table were checked for conflicts before this session.
-    for family in ("-4", "-6"):
-        rules = json.loads(netcmd("ip", family, "-j", "rule").stdout)
-        for rule in reversed(rules):
-            if rule.get("priority") in PRIORITIES:
-                netcmd("ip", family, "rule", "del", "pref", str(rule["priority"]))
-            elif rule.get("oif") == TUN or rule.get("iif") == TUN:
-                # sing-tun can leave an extra IPv6 oif rule after SIGKILL.
-                command = ["ip", family, "rule", "del", "pref", str(rule["priority"]), "table", str(rule["table"])]
-                for selector in ("oif", "iif"):
-                    if rule.get(selector) == TUN:
-                        command += [selector, TUN]
-                netcmd(*command)
-        routes = netcmd("ip", family, "route", "show", "table", TABLE, check=False)
-        if routes.stdout.strip():
-            netcmd("ip", family, "route", "flush", "table", TABLE)
-    if netcmd("ip", "link", "show", TUN, check=False).returncode == 0:
-        netcmd("ip", "link", "delete", TUN)
-    resolv = Path("/etc/resolv.conf")
-    original = base64.b64decode(state["resolv_conf"])
-    if resolv.read_bytes() == VPN_DNS:
-        resolv.write_bytes(original)  # Preserve symlink, mode and ownership.
-    elif resolv.read_bytes() != original:
-        print("Внимание: DNS изменён другой программой; не перезаписываю его.", file=sys.stderr)
-    if firewall_exists():
-        netcmd("nft", "delete", "table", "inet", "faygo_cli")
-    (STATE_DIR / "config.json").unlink(missing_ok=True)
-    STATE_FILE.unlink()
-    print("Правила Faygo убраны, DNS возвращён.", flush=True)
-
-
-VPN_DNS = b"nameserver 172.31.255.2\noptions timeout:2 attempts:2\n"
-FIREWALL = f"""table inet faygo_cli {{
- chain output {{
-  type filter hook output priority -10; policy drop;
-  oifname "lo" accept
-  meta mark {MARK} accept
-  oifname "{TUN}" accept
-  tcp sport {{ 22, 2222 }} ct state established accept
-  udp sport 68 udp dport 67 accept
-  counter reject with icmpx type admin-prohibited
- }}
- chain forward {{
-  type filter hook forward priority -10; policy drop;
-  oifname "{TUN}" accept
-  iifname "{TUN}" accept
- }}
-}}
-"""
-
-
-def run_tun(args, binary, config):
-    for tool in ("ip", "nft"):
-        if not shutil.which(tool):
-            raise RuntimeError(f"Не найден {tool}; для полного VPN нужны iproute2 и nftables")
-    with network_lock():
-        if STATE_FILE.exists():
-            raise RuntimeError("Остался аварийный сеанс. Сначала выполни: faygo recover")
-        if firewall_exists() or netcmd("ip", "link", "show", TUN, check=False).returncode == 0:
-            raise RuntimeError("Имя faygo0 или firewall faygo_cli уже занято; ничего не меняю")
-        for family in ("-4", "-6"):
-            rules = json.loads(netcmd("ip", family, "-j", "rule").stdout)
-            if any(x.get("priority") in PRIORITIES for x in rules):
-                raise RuntimeError("Приоритеты маршрутов 20580–20584 уже заняты")
-            if netcmd("ip", family, "route", "show", "table", TABLE, check=False).stdout.strip():
-                raise RuntimeError("Таблица маршрутов 20580 уже занята")
-        # Resolve the gateway before routing/DNS changes; TLS server_name stays intact.
-        proxy = config["outbounds"][0]
-        proxy["server"] = socket.getaddrinfo(proxy["server"], proxy["server_port"], socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
-        proxy["routing_mark"] = int(MARK, 16)
-        config["inbounds"].append({
-            "type": "tun", "tag": "vpn", "interface_name": TUN,
-            "address": ["172.31.255.1/30", "fdfe:dcba:9876::1/126"],
-            "mtu": 1500, "auto_route": False, "dns_mode": "disabled", "stack": "mixed",
-        })
-        config["dns"] = {
-            "servers": [{"type": "https", "tag": "remote", "server": "1.1.1.1",
-                         "detour": "proxy", "tls": {"enabled": True, "server_name": "cloudflare-dns.com"}}],
-            # The tested Faygo gateway closes IPv6 destination connections.
-            "final": "remote", "strategy": "ipv4_only",
-        }
-        config["route"]["rules"] = [{"port": 53, "action": "hijack-dns"}]
-        STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path = STATE_DIR / "config.json"
-        save_private(path, json.dumps(config))
-        checked = subprocess.run([binary, "check", "-c", str(path)], capture_output=True)
-        if checked.returncode:
-            path.unlink()
-            raise RuntimeError("sing-box отклонил TUN-конфигурацию; секретные параметры не выводятся")
-        netcmd("nft", "--check", "--file", "-", input=FIREWALL)
-        state = {"resolv_conf": base64.b64encode(Path("/etc/resolv.conf").read_bytes()).decode()}
-        write_state(state)
-        process = None
-        previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-        try:
-            print("Подготавливаю полный VPN…", flush=True)
-            process = subprocess.Popen([binary, "run", "-c", str(path)], start_new_session=True)
-            state.update(pid=process.pid, process_token=process_token(process.pid))
-            write_state(state)
-            deadline = time.monotonic() + 10
-            while netcmd("ip", "link", "show", TUN, check=False).returncode:
-                if process.poll() is not None or time.monotonic() > deadline:
-                    raise RuntimeError("TUN-интерфейс не запустился")
-                time.sleep(0.1)
-            netcmd("nft", "--file", "-", input=FIREWALL)
-            for family in ("-4", "-6"):
-                netcmd("ip", family, "route", "add", "default", "dev", TUN, "table", TABLE)
-                netcmd("ip", family, "rule", "add", "pref", "20580", "fwmark", MARK, "lookup", "main")
-                for priority, port in (("20581", "22"), ("20582", "2222")):
-                    netcmd("ip", family, "rule", "add", "pref", priority, "ipproto", "tcp", "sport", port, "lookup", "main")
-                if family == "-4":
-                    netcmd("ip", family, "rule", "add", "pref", "20583", "ipproto", "udp", "sport", "68", "dport", "67", "lookup", "main")
-                netcmd("ip", family, "rule", "add", "pref", "20584", "lookup", TABLE)
-            Path("/etc/resolv.conf").write_bytes(VPN_DNS)
-            print("Faygo VPN включён: TCP/UDP и DNS через Faygo; обход заблокирован. Ctrl+C — восстановить сеть.", flush=True)
-            if args.check:
-                result = subprocess.run(["curl", "-fsS", "--proxy", "", "--noproxy", "*",
-                                         "--connect-timeout", "10", "--max-time", "30",
-                                         "https://www.cloudflare.com/cdn-cgi/trace"], capture_output=True, text=True)
-                if result.returncode:
-                    raise RuntimeError(f"HTTPS без настроек прокси не прошёл через TUN: {result.stderr.strip()[:300]}")
-                fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-                print(f"Полный VPN работает. Выход: {fields.get('loc', '?')}; IP: {fields.get('ip', '?')}", flush=True)
-            else:
-                code = process.wait()
-                print(f"Движок VPN остановился ({code}). Интернет остаётся заблокирован до Ctrl+C или faygo recover.", file=sys.stderr, flush=True)
-                while True:
-                    signal.pause()
-        finally:
-            # A second Ctrl+C must not interrupt recovery halfway through.
-            for sig in previous:
-                signal.signal(sig, signal.SIG_IGN)
-            try:
-                if process and process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
-                restore_network()
-            finally:
-                for sig, handler in previous.items():
-                    signal.signal(sig, handler)
-
-
-def run(args):
-    binary = shutil.which("sing-box")
-    if not binary:
-        local = HOME / ".local/lib/faygo-cli/sing-box"
-        if local.is_file():
-            binary = str(local)
-        else:
-            raise RuntimeError("Не найден sing-box. Запусти: python3 install.py")
-    # Check before asking the API for a connection; do not interrupt another listener.
-    with socket.socket() as probe:
-        try:
-            probe.bind(("127.0.0.1", args.port))
-        except OSError:
-            raise RuntimeError(f"Порт {args.port} занят. Выбери другой через --port.") from None
-    reply = api("public/connection/connect", gate_id=args.server)
-    if not isinstance(reply, dict) or reply.get("platform") != "singbox":
-        raise RuntimeError("API вернул неподдерживаемую платформу")
-    configuration = reply.get("configuration", {})
-    outbounds = configuration.get("outbounds", [])
-    proxies = [x for x in outbounds if x.get("tag") == "proxy" and x.get("type") == "vless"]
-    if len(proxies) != 1:
-        raise RuntimeError("Ожидался один VLESS outbound с tag=proxy")
-    proxy = proxies[0].copy()
-    if not proxy.get("tls", {}).get("enabled") or proxy["tls"].get("insecure"):
-        raise RuntimeError("Отказ от конфигурации без проверки TLS")
-    for field in ("transport", "multiplex"):
-        if proxy.get(field) == {}:
-            del proxy[field]
-    # Discard provider rules and legacy block/dns outbounds; route only to VLESS.
-    config = {
-        "log": {"level": "warn"},
-        "inbounds": [{"type": "mixed", "tag": "local", "listen": "127.0.0.1", "listen_port": args.port}],
-        "outbounds": [proxy],
-        "route": {"final": "proxy"},
-    }
-    if not args.proxy:
-        return run_tun(args, binary, config)
-    with tempfile.TemporaryDirectory(prefix="faygo-") as directory:
-        path = Path(directory) / "config.json"
-        save_private(path, json.dumps(config))
-        checked = subprocess.run([binary, "check", "-c", str(path)], capture_output=True)
-        if checked.returncode:
-            raise RuntimeError("sing-box отклонил конфигурацию API; секретная конфигурация не выводится.")
-        process = subprocess.Popen([binary, "run", "-c", str(path)])
-        previous = signal.signal(signal.SIGTERM, interrupted)
-        try:
-            deadline = time.monotonic() + 10
-            while True:
-                if process.poll() is not None:
-                    raise RuntimeError("sing-box завершился при запуске")
-                try:
-                    with socket.create_connection(("127.0.0.1", args.port), timeout=0.2):
-                        break
-                except OSError:
-                    if time.monotonic() > deadline:
-                        raise RuntimeError("Локальный прокси не запустился за 10 секунд")
-                    time.sleep(0.1)
-            print(f"Faygo: socks5h://127.0.0.1:{args.port} (также HTTP proxy). Ctrl+C — остановить.", flush=True)
-            if args.check:
-                curl = shutil.which("curl")
-                if not curl:
-                    raise RuntimeError("Для --check нужен curl")
-                result = subprocess.run([curl, "--silent", "--show-error", "--fail", "--noproxy", "",
-                                         "--proxy", f"socks5h://127.0.0.1:{args.port}",
-                                         "--connect-timeout", "10", "--max-time", "30",
-                                         "https://www.cloudflare.com/cdn-cgi/trace"], capture_output=True, text=True)
-                if result.returncode:
-                    raise RuntimeError("HTTPS через Faygo не прошёл проверку")
-                fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-                print(f"HTTPS через Faygo работает. Выход: {fields.get('loc', '?')}; IP: {fields.get('ip', '?')}")
-            else:
-                code = process.wait()
-                if code:
-                    raise RuntimeError(f"sing-box завершился с кодом {code}")
-        finally:
-            signal.signal(signal.SIGTERM, previous)
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+# A source checkout and an installed release use the same entry point.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from faygo_client.account import Account
+from faygo_client.deployment import engine_path
+from faygo_client import session
 
 
 def main():
@@ -380,35 +22,36 @@ def main():
     commands.add_parser("profile", help="проверить подписку")
     commands.add_parser("servers", help="показать ID серверов")
     commands.add_parser("recover", help="восстановить сеть после аварийной остановки VPN")
-    start = commands.add_parser("run", help="полный VPN до Ctrl+C (root); --proxy для старого режима")
+    start = commands.add_parser("run", help="полный VPN до Ctrl+C (root); --proxy для локального прокси")
     start.add_argument("--proxy", action="store_true", help="только локальный прокси, без root и маршрутизации")
     start.add_argument("--server", type=int, default=2, help="ID из faygo servers (по умолчанию 2: Sweden)")
     start.add_argument("--port", type=int, default=2080)
     start.add_argument("--check", action="store_true", help="проверить HTTPS и остановиться")
     args = parser.parse_args()
+    if args.command == "run" and (not 1 <= args.port <= 65535 or args.server < 1):
+        parser.error("Некорректный порт или ID сервера")
     if args.command == "recover" or (args.command == "run" and not args.proxy):
         if os.geteuid() != 0:
-            executable = os.path.realpath(__file__)
+            executable = str(Path(__file__).resolve())
             os.execvp("sudo", ["sudo", sys.executable, executable, *sys.argv[1:]])
     if args.command == "recover":
-        with network_lock():
-            restore_network()
-    elif args.command == "login":
-        key = str(uuid.UUID(getpass.getpass("UUID-ключ Faygo: ").strip()))
-        save_private(CONFIG / "key", key)
+        session.recover()
+        return
+    account = Account()
+    if args.command == "login":
+        account.login(getpass.getpass("UUID-ключ Faygo: "))
         print("Ключ сохранён в ~/.config/faygo-cli/key (0600). Проверка: faygo profile")
     elif args.command == "profile":
-        profile = api("public/subscription/profile")
+        profile = account.profile()
         for field in ("name", "expiration_at", "data_usage", "data_limit"):
             print(f"{field}: {profile.get(field, '—')}")
     elif args.command == "servers":
-        servers = api("public/connection/list")
-        for server in servers:
+        for server in account.servers():
             print(f"{server['id']:>3}  {server['name']}")
     else:
-        if not 1 <= args.port <= 65535 or args.server < 1:
-            parser.error("Некорректный порт или ID сервера")
-        run(args)
+        binary = engine_path(account.home)
+        config = account.connection(args.server, args.port)
+        session.run(config, binary, args.port, proxy=args.proxy, check=args.check)
 
 
 if __name__ == "__main__":
@@ -418,6 +61,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nFaygo остановлен.", file=sys.stderr)
         sys.exit(130)
-    except (RuntimeError, OSError, ValueError) as error:
+    except (RuntimeError, OSError, ValueError, EOFError) as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         sys.exit(1)
