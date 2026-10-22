@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.log
+.env
+.faygo-key
+/config.json
+/state.json
+/key
+/device-id
+/device-name
